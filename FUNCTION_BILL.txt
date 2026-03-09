@@ -1,0 +1,255 @@
+create or replace FUNCTION XX_VINPATRA_BUILD_INVOICE_HTML (
+    p_order_id  NUMBER,
+    p_template  VARCHAR2
+) RETURN CLOB
+IS
+    l_html           CLOB;
+    l_created_at     TIMESTAMP;
+    l_status         VARCHAR2(20);
+    l_outlet_id      NUMBER;
+    l_customer_id    NUMBER;
+
+    -- outlet
+    v_outlet_name    VARCHAR2(200);
+    v_outlet_addr    VARCHAR2(500);
+    v_outlet_city    VARCHAR2(50);
+    v_outlet_state   VARCHAR2(50);
+    v_outlet_country VARCHAR2(50);
+    v_logo_blob      BLOB;
+    v_logo_base64    CLOB;
+    v_tmp_clob       CLOB;
+    v_mime_type varchar2(100);
+    v_logo_url varchar2(700);
+
+    -- customer
+    v_cust_name      VARCHAR2(200);
+    v_cust_phone     VARCHAR2(50);
+    v_cust_addr      VARCHAR2(500);
+
+    -- totals
+    l_total NUMBER := 0;
+
+    -- paging
+    c_rows_per_page CONSTANT NUMBER := 15;
+    v_row_count NUMBER := 0;
+
+BEGIN
+-------------------------------------------------
+-- ORDER HEADER
+-------------------------------------------------
+SELECT created_at, status, outlet_id, customer_id
+INTO l_created_at, l_status, l_outlet_id, l_customer_id
+FROM XX_VINPATRA_ORDERS
+WHERE order_id = p_order_id;
+
+-------------------------------------------------
+-- OUTLET
+-------------------------------------------------
+SELECT name, address, city, state, country, logo_blob ,logo_url 
+INTO v_outlet_name, v_outlet_addr, v_outlet_city,
+     v_outlet_state, v_outlet_country, v_logo_blob , v_logo_url
+FROM XX_VINPATRA_OUTLETS
+WHERE outlet_id = l_outlet_id;
+
+-------------------------------------------------
+-- LOGO — CLOB SAFE BASE64 (NO VARCHAR OVERFLOW)
+-------------------------------------------------
+IF v_logo_blob IS NOT NULL THEN
+    v_tmp_clob := apex_web_service.blob2clobbase64(v_logo_blob);
+    DBMS_LOB.createtemporary(v_logo_base64, TRUE);
+    --DBMS_LOB.append(v_logo_base64, 'data:image/png;base64,');
+    DBMS_LOB.append(v_logo_base64, 'data:'||v_mime_type||';base64,');
+    DBMS_LOB.append(v_logo_base64, v_tmp_clob);
+END IF;
+
+-------------------------------------------------
+-- CUSTOMER (NULL SAFE)
+-------------------------------------------------
+IF l_customer_id IS NOT NULL THEN
+BEGIN
+    SELECT NVL(first_name,'')||' '||NVL(last_name,''),
+           phone_number,
+           NVL(address_line1,'')||' '||NVL(city,'')||' '||NVL(state,'')
+    INTO v_cust_name, v_cust_phone, v_cust_addr
+    FROM XX_VINPATRA_CUSTOMERS
+    WHERE customer_id = l_customer_id;
+EXCEPTION WHEN NO_DATA_FOUND THEN NULL;
+END;
+END IF;
+
+-------------------------------------------------
+-- TOTAL FROM LINES
+-------------------------------------------------
+SELECT NVL(SUM(quantity*unit_price-NVL(discount,0)),0)
+INTO l_total
+FROM XX_VINPATRA_ORDER_LINES
+WHERE order_id = p_order_id;
+
+-------------------------------------------------
+-- HTML START
+-------------------------------------------------
+l_html := q'[
+<html>
+<head>
+<style>
+body{font-family:Arial;margin:30px;}
+.invoice-title{
+  text-align:center;
+  font-size:28px;
+  font-weight:bold;
+  margin-bottom:20px;
+}
+.header-table{width:100%;border-collapse:collapse;margin-bottom:15px}
+.logo{
+  height:70px;
+  max-width:220px;
+}
+.meta{text-align:right;font-size:14px}
+table{width:100%;border-collapse:collapse;margin-top:15px}
+th{background:#333;color:white;padding:8px}
+td{border:1px solid #ccc;padding:7px}
+.right{text-align:right}
+.page-break{page-break-after:always}
+.footer{text-align:center;margin-top:30px;color:#777;font-size:12px}
+@media print {
+    .print-section {
+        display: none !important;
+        style="text-align:center;
+    }
+}
+</style>
+</head>
+<body>
+]';
+
+-------------------------------------------------
+-- TITLE OUTSIDE TABLE
+-------------------------------------------------
+l_html := l_html || '<div class="invoice-title">INVOICE</div>';
+
+-------------------------------------------------
+-- HEADER TWO COLUMN TABLE
+-------------------------------------------------
+l_html := l_html || '<table class="header-table"><tr><td>';
+
+--IF v_mime_type  IS NOT NULL THEN
+--l_html := l_html ||
+--'<img src="https://raw.githubusercontent.com/Dev-Prathmesh/Vinapatra/refs/heads/main/logo/22.jpg"height="70"><br>';
+    -------------------------------------------------
+-- LOGO URL (WORKS FOR JPEG, PNG, WEBP, ETC.)
+-------------------------------------------------
+
+
+    l_html := l_html ||
+        '<img src="' || v_logo_url || '" height="70"><br>';
+
+--END IF;
+
+
+l_html := l_html ||
+'<br><b>'||v_outlet_name||'</b><br>'||
+v_outlet_addr||'<br>'||
+v_outlet_city||', '||v_outlet_state||'<br>'||
+v_outlet_country||'</td>';
+
+-- RIGHT SIDE META
+l_html := l_html || '<td class="meta">'||
+'<b>Order ID:</b> '||p_order_id||'<br>'||
+'<b>Date:</b> '||TO_CHAR(l_created_at,'DD-MON-YYYY HH24:MI')||'<br>'||
+'<b>Status:</b> '||l_status||'<br>';
+
+IF TRIM(v_cust_name) IS NOT NULL THEN
+    l_html := l_html ||
+    '<br><b>Customer:</b> '||v_cust_name||
+    '<br><b>Phone:</b> '||v_cust_phone||
+    '<br>'||v_cust_addr;
+END IF;
+
+l_html := l_html || '</td></tr></table>';
+
+-------------------------------------------------
+-- LINE TABLE HEADER
+-------------------------------------------------
+l_html := l_html || q'[
+<table>
+<tr>
+<th>Product</th>
+<th>Qty</th>
+<th>Unit Price</th>
+<th>Discount</th>
+<th>Line Total</th>
+</tr>
+]';
+
+-------------------------------------------------
+-- LINES LOOP
+-------------------------------------------------
+FOR rec IN (
+    SELECT p.product_name,
+           l.quantity,
+           l.unit_price,
+           NVL(l.discount,0) discount,
+           (l.quantity*l.unit_price-NVL(l.discount,0)) line_total
+    FROM XX_VINPATRA_ORDER_LINES l
+    JOIN XX_VINPATRA_PRODUCTS p
+      ON p.product_id = l.product_id
+    WHERE l.order_id = p_order_id
+    ORDER BY l.line_id
+)
+LOOP
+
+v_row_count := v_row_count + 1;
+
+l_html := l_html ||
+'<tr>'||
+'<td>'||rec.product_name||'</td>'||
+'<td class="right">'||rec.quantity||'</td>'||
+'<td class="right">'||TO_CHAR(rec.unit_price,'999G999D00')||'</td>'||
+'<td class="right">'||TO_CHAR(rec.discount,'999G999D00')||'</td>'||
+'<td class="right">'||TO_CHAR(rec.line_total,'999G999D00')||'</td>'||
+'</tr>';
+
+IF MOD(v_row_count, c_rows_per_page) = 0 THEN
+    l_html := l_html ||
+    '</table><div class="page-break"></div>'||--
+    '<table><tr>
+     <th>Product</th>
+     <th>Qty</th>
+     <th>Unit Price</th>
+     <th>Discount</th>
+     <th>Line Total</th>
+     </tr>';
+END IF;
+
+END LOOP;
+
+-------------------------------------------------
+-- TOTAL + FOOTER
+-------------------------------------------------
+l_html := l_html ||
+'</table>'||
+
+'<h2 class="right">TOTAL: '|| l_total ||'</h2>'||
+
+'<div class="footer">Generated by Vinpatra</div>'||
+
+-- Print Section (Entire block will hide)
+'<div class="print-section">'||
+'  <button onclick="window.print()" '||
+'     style="padding:10px 20px; background:#007bff; color:white; border:none; border-radius:5px; font-weight:bold; cursor:pointer;">'||
+'     🖨 Print Invoice'||
+'  </button>'||
+'</div>'||
+
+'</body></html>';
+
+RETURN l_html;
+
+--EXCEPTION
+--WHEN NO_DATA_FOUND THEN
+    --RETURN '<h2>Invalid Order ID</h2>';
+EXCEPTION
+WHEN OTHERS THEN
+    RETURN 'ERROR: ' || SQLERRM || ' LINE: ' || $$PLSQL_LINE;
+END;
+/
